@@ -1,0 +1,154 @@
+# T2.1 - Compressed Crop Disease Classifier
+# AIMS KTT Hackathon - Tier 2
+# Candidate : Jerome TEYI
+# Domaine : AgriTech • Computer Vision • Quantization • Serving
+# ---
+
+from __future__ import annotations
+
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+try:
+    from tflite_runtime.interpreter import Interpreter
+except ImportError:
+    try:
+        from tensorflow.lite.python.interpreter import Interpreter
+    except ImportError as exc:
+        raise RuntimeError(
+            "Install tflite-runtime or tensorflow-cpu to run TFLite inference."
+        ) from exc
+
+
+APP_ROOT = Path(__file__).resolve().parents[1]
+MODEL_CANDIDATES = [
+    APP_ROOT / "model.tflite",
+    APP_ROOT / "models" / "model.tflite",
+    Path(os.getenv("MODEL_PATH", "")),
+]
+CLASS_NAMES = ["healthy", "maize_rust", "maize_blight", "cassava_mosaic", "bean_spot"]
+IMAGE_SIZE = (224, 224)
+
+app = FastAPI(
+    title="T2.1 - Compressed Crop Disease Classifier",
+    version="1.0.0",
+    description="FastAPI service for INT8 TFLite crop disease inference.",
+)
+
+interpreter: Interpreter | None = None
+input_detail: dict[str, Any] | None = None
+output_detail: dict[str, Any] | None = None
+
+
+def find_model_path() -> Path:
+    for candidate in MODEL_CANDIDATES:
+        if candidate and str(candidate) != "." and candidate.exists():
+            return candidate
+    raise FileNotFoundError("model.tflite not found at project root or models/model.tflite")
+
+
+def load_interpreter() -> None:
+    global interpreter, input_detail, output_detail
+    model_path = find_model_path()
+    interpreter = Interpreter(model_path=str(model_path), num_threads=os.cpu_count() or 1)
+    interpreter.allocate_tensors()
+    input_detail = interpreter.get_input_details()[0]
+    output_detail = interpreter.get_output_details()[0]
+
+
+@app.on_event("startup")
+def startup() -> None:
+    load_interpreter()
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+def preprocess_image(file: UploadFile) -> np.ndarray:
+    if file.content_type not in {"image/jpeg", "image/png"}:
+        raise HTTPException(status_code=415, detail="Only JPEG and PNG images are supported.")
+
+    try:
+        image = Image.open(file.file)
+        image = ImageOps.exif_transpose(image).convert("RGB")
+    except (UnidentifiedImageError, OSError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid image file.") from exc
+
+    image = image.resize(IMAGE_SIZE, Image.Resampling.BILINEAR)
+    return np.asarray(image, dtype=np.float32)[np.newaxis, ...]
+
+
+def quantize_input(sample: np.ndarray) -> np.ndarray:
+    assert input_detail is not None
+    dtype = input_detail["dtype"]
+    scale, zero_point = input_detail["quantization"]
+
+    if dtype in (np.int8, np.uint8):
+        if scale == 0:
+            raise RuntimeError("Invalid input quantization scale.")
+        sample = np.round(sample / scale + zero_point)
+        limits = np.iinfo(dtype)
+        return np.clip(sample, limits.min, limits.max).astype(dtype)
+
+    return sample.astype(dtype)
+
+
+def dequantize_output(output: np.ndarray) -> np.ndarray:
+    assert output_detail is not None
+    dtype = output_detail["dtype"]
+    scale, zero_point = output_detail["quantization"]
+
+    if dtype in (np.int8, np.uint8) and scale != 0:
+        output = (output.astype(np.float32) - zero_point) * scale
+    else:
+        output = output.astype(np.float32)
+
+    output = np.squeeze(output)
+    total = float(np.sum(output))
+    if total > 0 and np.all(output >= 0):
+        return output / total
+    exp = np.exp(output - np.max(output))
+    return exp / np.sum(exp)
+
+
+def run_inference(sample: np.ndarray) -> tuple[np.ndarray, float]:
+    assert interpreter is not None and input_detail is not None and output_detail is not None
+    input_index = input_detail["index"]
+    output_index = output_detail["index"]
+
+    start = time.perf_counter()
+    interpreter.set_tensor(input_index, quantize_input(sample))
+    interpreter.invoke()
+    raw_output = interpreter.get_tensor(output_index)
+    latency_ms = (time.perf_counter() - start) * 1000
+
+    return dequantize_output(raw_output), latency_ms
+
+
+@app.post("/predict")
+def predict(file: UploadFile = File(...)) -> dict[str, Any]:
+    sample = preprocess_image(file)
+    probabilities, latency_ms = run_inference(sample)
+
+    ranked_indices = np.argsort(probabilities)[::-1]
+    best_index = int(ranked_indices[0])
+    top3 = [
+        {"label": CLASS_NAMES[int(index)], "confidence": round(float(probabilities[index]), 4)}
+        for index in ranked_indices[:3]
+    ]
+
+    return {
+        "label": CLASS_NAMES[best_index],
+        "confidence": round(float(probabilities[best_index]), 4),
+        "top3": top3,
+        "latency_ms": round(float(latency_ms), 2),
+        "rationale": "Prediction generated by an INT8 MobileNetV3-Small model from the uploaded leaf image.",
+    }

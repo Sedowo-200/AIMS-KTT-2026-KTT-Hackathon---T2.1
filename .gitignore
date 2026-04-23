@@ -1,6 +1,15 @@
+@"
 .venv/
-venv/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+.vscode/
 
+*.pdf
+cassava-leaf-disease-classification/
+maize_only_base/
+
+data/**
+!data/*.zip
+!data/**/*.zip
+"@ | Set-Content .gitignore
