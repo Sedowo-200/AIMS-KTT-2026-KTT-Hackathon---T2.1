@@ -125,8 +125,3 @@ Detailed Docker commands are in `DOCKER_INSTRUCTIONS.md`.
 
 The low-bandwidth design is documented in `ussd_fallback.md`. The workflow uses a cooperative kiosk, village agent, or extension officer as a relay: image capture happens locally, the farmer or agent sends a USSD image ID, the INT8 model runs on a local CPU device, and the diagnosis is returned by SMS/USSD.
 
-## Video
-
-4-minute demo video URL: `TODO_ADD_VIDEO_URL`
-
-Video notes are in `docs/video_notes.md`, and the full spoken guide is in `VIDEO_SCRIPT_AND_QA.txt`.
